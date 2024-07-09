@@ -1,19 +1,90 @@
 package dev.thihup.jvms.verifier.prolog.extractor;
 
+import dev.nipafx.args.Args;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.parser.Parser;
 import org.jsoup.select.Elements;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.StructuredTaskScope;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Gatherer;
+import java.util.stream.IntStream;
+
+import static java.util.concurrent.StructuredTaskScope.Subtask.State.SUCCESS;
 
 public class Main {
 
+    record Result(int version, String spec){}
+
+    public record Arguments(Optional<Integer> startVersion, Optional<Integer> endVersion, Optional<String> url, Optional<String> outputFolder, Optional<Boolean> keepDuplicates) {}
+
     public static void main(String[] args) throws Throwable {
-        // Fetch the HTML content from the URL
-        String url = "https://docs.oracle.com/javase/specs/jvms/se17/html/jvms-4.html#jvms-4.10";
-        Document doc = Jsoup.connect(url).get();
+
+        Arguments parse = Args.parse(args, Arguments.class);
+        try(var scope = new StructuredTaskScope<Result>()) {
+
+            // Fetch the HTML content from the URL
+            String url = parse.url().orElse("https://docs.oracle.com/javase/specs/jvms/se%s/html/jvms-4.html#jvms-4.10");
+            List<StructuredTaskScope.Subtask<Result>> list = IntStream.rangeClosed(parse.startVersion().orElse(7), parse.endVersion().orElse(Runtime.version().feature()))
+                    .mapToObj(args1 -> Map.entry(args1, url.formatted(args1)))
+                    .map(map -> scope.fork(() -> new Result(map.getKey(), extracted(map.getValue())))).toList();
+
+            scope.join();
+
+            boolean b = parse.keepDuplicates().orElse(false);
+            Map<Integer, String> collect = list.stream()
+                .filter(x -> x.state() == SUCCESS)
+                .map(StructuredTaskScope.Subtask::get)
+                .gather(deduplicateAdjacent(Result::spec, b))
+                .collect(Collectors.toMap(Result::version, Result::spec));
+
+            for (Map.Entry<Integer, String> integerStringEntry : collect.entrySet()) {
+                Files.writeString(Paths.get(parse.outputFolder().orElse("."), "jvms-%s-prolog.pl".formatted(integerStringEntry.getKey())), integerStringEntry.getValue());
+            }
+        }
+
+    }
+
+    public static <T, R> Gatherer<T,?,T> deduplicateAdjacent(Function<T, R> mapper, boolean skip) {
+        class State { R prev; boolean hasPrev; }
+        return Gatherer.ofSequential(
+                State::new,
+                (state, element, downstream) -> {
+                    if (skip) {
+                        return downstream.push(element);
+                    }
+                    R apply = mapper.apply(element);
+                    if (!state.hasPrev) {
+                        state.hasPrev = true;
+                        state.prev = apply;
+                        return downstream.push(element);
+                    } else if (!Objects.equals(state.prev, apply)) {
+                        state.prev = apply;
+                        return downstream.push(element);
+                    } else {
+                        return true; // skip duplicate
+                    }
+                }
+        );
+    }
+
+    private static String extracted(String url) {
+        Document doc = null;
+        try {
+            doc = Jsoup.connect(url).get();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
 
         // Parse the HTML and find the div element containing the a tag with name='jvms-4.10'
         Element jvm410Node = doc.selectFirst("div.section:has(a[name=jvms-4.10])");
@@ -32,11 +103,10 @@ public class Main {
                     .map(Main::fixProlog)
                     .collect(Collectors.joining("\n"));
 
-            System.out.println(prolog);
+            return prolog;
 
-        } else {
-            System.out.println("Element not found.");
         }
+        throw new RuntimeException("Could not parse");
     }
 
     private static String fixProlog(String s) {
